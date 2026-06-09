@@ -1,5 +1,5 @@
 # ── Stage 1: Build static musl binary ────────────────────────────────────────
-FROM rust:1.82-slim AS builder
+FROM rust:1.85-slim AS builder
 
 # musl target for fully static binary
 RUN rustup target add x86_64-unknown-linux-musl \
