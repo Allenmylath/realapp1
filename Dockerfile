@@ -1,26 +1,18 @@
-# ── Stage 1: Build static musl binary ────────────────────────────────────────
-FROM rust:1.85-slim AS builder
-
-# musl target for fully static binary
-RUN rustup target add x86_64-unknown-linux-musl \
-    && apt-get update \
-    && apt-get install -y musl-tools \
-    && rm -rf /var/lib/apt/lists/*
-
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+FROM fedora:40 AS builder
 WORKDIR /app
-COPY Cargo.toml ./
-COPY src ./src
+COPY Cargo.toml Cargo.lock* ./
+COPY src/ src/
+RUN dnf install -y gcc gcc-c++ make pkg-config openssl-devel && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
+    dnf clean all
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN cargo build --release --bin realapp1
 
-RUN cargo build --release --target x86_64-unknown-linux-musl
-
-# ── Stage 2: Minimal runtime image (~5 MB) ───────────────────────────────────
-FROM scratch
-
-# CA certs needed for HTTPS calls to Sarvam / OpenAI / Deepgram
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/rustvani-fly /rustvani-fly
-
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM fedora:40
+RUN dnf install -y ca-certificates openssl && dnf clean all
+COPY --from=builder /app/target/release/realapp1 /usr/local/bin/realapp1
+ENV PORT=8080
 EXPOSE 8080
-
-ENTRYPOINT ["/rustvani-fly"]
+CMD ["realapp1"]

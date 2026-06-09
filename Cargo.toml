@@ -1,12 +1,17 @@
 [package]
-name = "rustvani-fly"
+name = "realapp1"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "rustvani-fly"
+name = "realapp1"
 path = "src/main.rs"
 
 [dependencies]
 rustvani = "0.2.6"
 tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors"] }
+env_logger = "0.11"
+log = "0.4"
+serde_json = "1"
