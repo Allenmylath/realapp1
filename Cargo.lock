@@ -1988,6 +1988,7 @@ name = "realapp1"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "env_logger",
  "log",
  "rustvani",
@@ -1995,6 +1996,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tower-http 0.5.2",
+ "uuid",
 ]
 
 [[package]]
