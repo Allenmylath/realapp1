@@ -1,37 +1,37 @@
-# fly.toml — rustvani voice agent
-# Region: Mumbai (bom) for lowest latency to Indian users
+# fly.toml app configuration file generated for realapp1 on 2026-06-09T05:30:09Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "rustvani-fly"
-primary_region = "bom"
+app = 'realapp1'
+primary_region = 'bom'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  PORT = "8080"
+  PORT = '8080'
 
-# WebSocket keep-alive — voice agents need long-lived connections
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
 
   [http_service.concurrency]
-    type = "connections"
+    type = 'connections'
     hard_limit = 100
     soft_limit = 80
 
-# Upgrade HTTP → WebSocket
-[[http_service.checks]]
-  grace_period = "5s"
-  interval = "15s"
-  method = "GET"
-  path = "/health"
-  protocol = "http"
-  timeout = "5s"
+  [[http_service.checks]]
+    interval = '15s'
+    timeout = '5s'
+    grace_period = '5s'
+    method = 'GET'
+    path = '/health'
+    protocol = 'http'
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "512mb"
+  size = 'shared-cpu-1x'
+  memory = '512mb'
