@@ -1,4 +1,6 @@
-use std::sync::{Arc, Mutex};
+mod tools;
+
+use std::sync::Arc;
 
 use axum::{
     Router,
@@ -6,14 +8,15 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::CorsLayer;
 
 use rustvani::{
     system_clock, SileroVadNative, VadParams,
     PipelineParams, PipelineTask,
-    shared_context,
 };
-use rustvani::context::LLMContext;
+use rustvani::adapters::schemas::ToolsSchema;
+use rustvani::context::shared_context_with_tools;
 use rustvani::observer::BaseObserver;
 use rustvani::processors::{
     llm_assistant_aggregator::LLMAssistantAggregator,
@@ -28,10 +31,34 @@ use rustvani::services::{
     SarvamSttConfig, SarvamSttHandler,
     DeepgramTtsConfig, DeepgramTtsHandler,
 };
+use rustvani::services::llm::FunctionRegistry;
 use rustvani::transport::websocket::{WebSocketParams, WebSocketTransport};
 use rustvani::transport::TransportParams;
 
-const SYSTEM_PROMPT: &str = "You are a helpful voice assistant.";
+use tools::{client_tool_schemas, register_client_tools};
+
+// ---------------------------------------------------------------------------
+// System prompt
+// ---------------------------------------------------------------------------
+
+const SYSTEM_PROMPT: &str = "\
+You are a helpful real estate voice assistant with access to a client database.
+
+You can:
+- Add new clients (requires: name, phone, email, and notes)
+- Search for clients by name
+- List all active clients
+
+You CANNOT delete clients under any circumstances. If asked to delete, \
+politely explain that deletion is not supported.
+
+When adding a client, always confirm back the details you recorded. \
+When searching or listing, summarise clearly what you found. \
+Keep responses concise and natural — this is a voice interface.";
+
+// ---------------------------------------------------------------------------
+// Connection counter
+// ---------------------------------------------------------------------------
 
 static CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -48,6 +75,8 @@ struct AppState {
     sarvam_api_key:   String,
     openai_api_key:   String,
     deepgram_api_key: String,
+    /// Shared DB pool — cloned (Arc) into each connection's tool closures.
+    db_pool:          Arc<sqlx::PgPool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -87,10 +116,17 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
         },
     );
 
-    // --- Shared context ---
-    let context = shared_context(Some(SYSTEM_PROMPT.into()));
+    // --- Build registry and register client tools ---
+    let mut registry = FunctionRegistry::new();
+    register_client_tools(&mut registry, app_state.db_pool.clone());
 
-    // --- RAVI processor (frontend integration) ---
+    // --- Build tool schemas for LLM context ---
+    let tool_schemas = ToolsSchema::new(client_tool_schemas());
+
+    // --- Shared context with system prompt and tools ---
+    let context = shared_context_with_tools(Some(SYSTEM_PROMPT.into()), tool_schemas, None);
+
+    // --- RAVI processor ---
     let ravi = RaviProcessor::new(RaviParams {
         context: Some(context.clone()),
         ..RaviParams::default()
@@ -109,12 +145,15 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
     })
     .into_processor();
 
-    // --- LLM ---
-    let llm = OpenAILLMHandler::new(OpenAILLMConfig {
-        api_key: app_state.openai_api_key.clone(),
-        model:   "gpt-4o-mini".to_string(),
-        ..OpenAILLMConfig::default()
-    })
+    // --- LLM with registry ---
+    let llm = OpenAILLMHandler::with_registry(
+        OpenAILLMConfig {
+            api_key: app_state.openai_api_key.clone(),
+            model:   "gpt-4o-mini".to_string(),
+            ..OpenAILLMConfig::default()
+        },
+        registry,
+    )
     .into_processor();
 
     // --- TTS ---
@@ -172,10 +211,24 @@ async fn main() {
     )
     .init();
 
+    // --- DB pool ---
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL not set");
+
+    let db_pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to connect to database: {}", e));
+
+    let db_pool = Arc::new(db_pool);
+    log::info!("Database pool initialised");
+
     let app_state = AppState {
         sarvam_api_key:   std::env::var("SARVAM_API_KEY").expect("SARVAM_API_KEY not set"),
         openai_api_key:   std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set"),
         deepgram_api_key: std::env::var("DEEPGRAM_API_KEY").expect("DEEPGRAM_API_KEY not set"),
+        db_pool,
     };
 
     let app = Router::new()

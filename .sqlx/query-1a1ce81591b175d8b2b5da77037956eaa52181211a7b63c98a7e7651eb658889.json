@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO clients\n                    (name, email, phone, budget_min, budget_max, preferred_areas, notes, status)\n                VALUES\n                    ($1, $2, $3, $4, $5, $6, $7, 'active')\n                RETURNING id, created_at\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "1a1ce81591b175d8b2b5da77037956eaa52181211a7b63c98a7e7651eb658889"
+}

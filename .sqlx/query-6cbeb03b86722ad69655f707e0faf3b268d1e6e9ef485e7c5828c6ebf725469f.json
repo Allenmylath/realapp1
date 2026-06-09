@@ -1,0 +1,74 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT id, name, email, phone, budget_min, budget_max,\n                       preferred_areas, status, notes, created_at\n                FROM clients\n                WHERE status = 'active'\n                ORDER BY created_at DESC\n                LIMIT 50\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "email",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "phone",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "budget_min",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "budget_max",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "preferred_areas",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "notes",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "6cbeb03b86722ad69655f707e0faf3b268d1e6e9ef485e7c5828c6ebf725469f"
+}

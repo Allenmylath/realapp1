@@ -1,0 +1,5 @@
+cargo:rustc-env=RUSTVANI_CACHE_DIR=/home/user/.rustvani/cache
+cargo:rerun-if-changed=build.rs
+cargo:rerun-if-env-changed=RUSTVANI_CACHE_DIR
+cargo:rustc-cfg=rustvani_bundle_silero_native
+cargo:rustc-env=RUSTVANI_SILERO_NATIVE_PATH=/home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustvani-0.2.6/src/vad/data/silero_vad_16k.bin

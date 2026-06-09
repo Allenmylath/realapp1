@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT id, name, email, phone, budget_min, budget_max,\n                       preferred_areas, status, notes, created_at\n                FROM clients\n                WHERE name ILIKE $1\n                ORDER BY name ASC\n                LIMIT 10\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "email",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "phone",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "budget_min",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "budget_max",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "preferred_areas",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "notes",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "409b396b9a0c47681732b1633f0b4878ddc4cc292bdcc217fec86535c9b0576c"
+}
