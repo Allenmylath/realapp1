@@ -1,0 +1,12 @@
+[package]
+name = "rustvani-fly"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rustvani-fly"
+path = "src/main.rs"
+
+[dependencies]
+rustvani = "0.2.6"
+tokio = { version = "1", features = ["full"] }
