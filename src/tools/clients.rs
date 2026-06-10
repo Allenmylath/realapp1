@@ -1,9 +1,9 @@
 //! Client management tools.
 //!
 //! Search stages used by `get_client_by_name`:
-//!   1. ILIKE     — case-insensitive substring match (fast, exact)
+//!   1. Soundex   — fuzzystrmatch phonetic match (handles voice transcription variants)
 //!   2. Trigram   — pg_trgm similarity > 0.3 (handles typos, partial words)
-//!   3. Soundex   — fuzzystrmatch phonetic match (handles voice transcription variants)
+//!   3. ILIKE     — case-insensitive substring match (final fallback)
 //!
 //! Stages 2 and 3 require the PostgreSQL extensions:
 //!   CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -50,6 +50,29 @@ impl ClientRow {
             "notes":           self.notes,
             "created_at":      self.created_at.to_string(),
         })
+    }
+
+    /// One-line full detail string for the LLM summary. The LLM only ever
+    /// sees the summary (full_data goes downstream, not into model context),
+    /// so every field the model may be asked about must appear here.
+    fn detail_line(&self) -> String {
+        let budget = match (self.budget_min, self.budget_max) {
+            (Some(mn), Some(mx)) => format!("₹{} – ₹{}", mn, mx),
+            (Some(mn), None)     => format!("from ₹{}", mn),
+            (None, Some(mx))     => format!("up to ₹{}", mx),
+            (None, None)         => "not specified".to_string(),
+        };
+        format!(
+            "{} (ID: {}) — Phone: {} | Email: {} | Budget: {} | Areas: {} | Status: {} | Notes: {}",
+            self.name,
+            self.id,
+            self.phone.as_deref().unwrap_or("not on file"),
+            self.email,
+            budget,
+            self.preferred_areas.as_deref().unwrap_or("not specified"),
+            self.status,
+            self.notes.as_deref().unwrap_or("none"),
+        )
     }
 }
 
@@ -181,6 +204,61 @@ pub fn client_tool_schemas() -> Vec<FunctionSchema> {
         })),
 
         FunctionSchema::new(
+            "update_client",
+            "Update an existing client's details in the CRM. \
+             First locate the client with get_client_by_name to obtain their ID, \
+             confirm with the user which client is meant if several match, then call \
+             this tool with the ID and ONLY the fields that should change — omitted \
+             fields keep their current values. \
+             Clients can be marked inactive via the status field, but records are \
+             never deleted. \
+             After updating, always read back the updated details so the user can confirm.",
+        )
+        .with_parameters(json!({
+            "type": "object",
+            "properties": {
+                "client_id": {
+                    "type": "string",
+                    "description": "UUID of the client to update, as returned by get_client_by_name or list_clients"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "New full name. Omit to keep current."
+                },
+                "phone": {
+                    "type": "string",
+                    "description": "New phone number. Omit to keep current."
+                },
+                "email": {
+                    "type": "string",
+                    "description": "New email address. Omit to keep current."
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Replacement notes text. Omit to keep current."
+                },
+                "budget_min": {
+                    "type": "integer",
+                    "description": "New minimum budget in INR. Omit to keep current."
+                },
+                "budget_max": {
+                    "type": "integer",
+                    "description": "New maximum budget in INR. Omit to keep current."
+                },
+                "preferred_areas": {
+                    "type": "string",
+                    "description": "Comma-separated preferred localities. Omit to keep current."
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["active", "inactive"],
+                    "description": "Set 'inactive' to hide a client from the active list (records are never deleted). Omit to keep current."
+                }
+            },
+            "required": ["client_id"]
+        })),
+
+        FunctionSchema::new(
             "list_clients",
             "Retrieve all active clients from the CRM, ordered by most recently added. \
              Returns up to 50 clients, each with full contact details, budget range, \
@@ -202,8 +280,11 @@ pub fn client_tool_schemas() -> Vec<FunctionSchema> {
 pub fn register_client_tools(registry: &mut FunctionRegistry, pool: Arc<PgPool>) {
     register_add_client(registry, pool.clone());
     register_get_client_by_name(registry, pool.clone());
+    register_update_client(registry, pool.clone());
     register_list_clients(registry, pool.clone());
-    log::info!("ClientTools: registered add_client, get_client_by_name, list_clients");
+    log::info!(
+        "ClientTools: registered add_client, get_client_by_name, update_client, list_clients"
+    );
 }
 
 // ── add_client ───────────────────────────────────────────────────────────────
@@ -333,13 +414,13 @@ fn register_get_client_by_name(registry: &mut FunctionRegistry, pool: Arc<PgPool
             }
 
             let count = rows.len();
-            let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+            let details: Vec<String> = rows.iter().map(|r| r.detail_line()).collect();
             let summary = format!(
-                "Found {} client(s) for '{}' via {}: {}.",
+                "Found {} client(s) for '{}' via {}:\n{}",
                 count,
                 raw_name,
                 method,
-                names.join(", ")
+                details.join("\n")
             );
 
             let data: Vec<Value> = rows
@@ -352,6 +433,109 @@ fn register_get_client_by_name(registry: &mut FunctionRegistry, pool: Arc<PgPool
                 .collect();
 
             ToolCallOutput::with_data(summary, json!(data))
+        }
+    });
+}
+
+// ── update_client ────────────────────────────────────────────────────────────
+
+fn register_update_client(registry: &mut FunctionRegistry, pool: Arc<PgPool>) {
+    registry.register_data("update_client", move |args: String| {
+        let pool = pool.clone();
+        async move {
+            let v: Value = match serde_json::from_str(&args) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ToolCallOutput::summary_only(format!(
+                        "Failed to parse arguments: {}",
+                        e
+                    ));
+                }
+            };
+
+            let client_id = match v["client_id"].as_str().map(Uuid::parse_str) {
+                Some(Ok(id)) => id,
+                Some(Err(_)) => {
+                    return ToolCallOutput::summary_only(
+                        "Invalid client_id: not a valid UUID. \
+                         Use get_client_by_name first to obtain the client's ID.",
+                    );
+                }
+                None => {
+                    return ToolCallOutput::summary_only("Missing required field: client_id");
+                }
+            };
+
+            let name            = v["name"].as_str().map(|s| s.trim().to_string());
+            let email           = v["email"].as_str().map(|s| s.trim().to_string());
+            let phone           = v["phone"].as_str().map(|s| s.trim().to_string());
+            let notes           = v["notes"].as_str().map(|s| s.trim().to_string());
+            let budget_min      = v["budget_min"].as_i64();
+            let budget_max      = v["budget_max"].as_i64();
+            let preferred_areas = v["preferred_areas"].as_str().map(|s| s.trim().to_string());
+            let status          = v["status"].as_str().map(|s| s.trim().to_string());
+
+            if let Some(s) = status.as_deref() {
+                if s != "active" && s != "inactive" {
+                    return ToolCallOutput::summary_only(
+                        "Invalid status: must be 'active' or 'inactive'.",
+                    );
+                }
+            }
+
+            if name.is_none() && email.is_none() && phone.is_none() && notes.is_none()
+                && budget_min.is_none() && budget_max.is_none()
+                && preferred_areas.is_none() && status.is_none()
+            {
+                return ToolCallOutput::summary_only(
+                    "No fields to update: provide at least one of name, phone, email, \
+                     notes, budget_min, budget_max, preferred_areas, or status.",
+                );
+            }
+
+            // NULL binds leave the column unchanged via COALESCE; fields can
+            // therefore be updated but never cleared, and rows never deleted.
+            let sql = "UPDATE clients SET \
+                       name            = COALESCE($2, name), \
+                       email           = COALESCE($3, email), \
+                       phone           = COALESCE($4, phone), \
+                       budget_min      = COALESCE($5, budget_min), \
+                       budget_max      = COALESCE($6, budget_max), \
+                       preferred_areas = COALESCE($7, preferred_areas), \
+                       notes           = COALESCE($8, notes), \
+                       status          = COALESCE($9, status) \
+                       WHERE id = $1 \
+                       RETURNING id, name, email, phone, budget_min, budget_max, \
+                                 preferred_areas, status, notes, created_at";
+
+            match sqlx::query_as::<_, ClientRow>(sql)
+                .bind(client_id)
+                .bind(name)
+                .bind(email)
+                .bind(phone)
+                .bind(budget_min)
+                .bind(budget_max)
+                .bind(preferred_areas)
+                .bind(notes)
+                .bind(status)
+                .fetch_optional(pool.as_ref())
+                .await
+            {
+                Ok(Some(row)) => {
+                    let summary = format!("Client updated. {}", row.detail_line());
+                    let data = row.to_json();
+                    ToolCallOutput::with_data(summary, data)
+                }
+                Ok(None) => ToolCallOutput::summary_only(format!(
+                    "No client found with ID {}. \
+                     Use get_client_by_name to look up the correct ID.",
+                    client_id
+                )),
+                Err(e) => {
+                    log::error!("update_client DB error: {}", e);
+                    ToolCallOutput::summary_only(format!("Failed to update client: {}", e))
+                }
+            }
         }
     });
 }
@@ -376,11 +560,11 @@ fn register_list_clients(registry: &mut FunctionRegistry, pool: Arc<PgPool>) {
                 }
                 Ok(rows) => {
                     let count = rows.len();
-                    let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+                    let details: Vec<String> = rows.iter().map(|r| r.detail_line()).collect();
                     let summary = format!(
-                        "{} active client(s): {}.",
+                        "{} active client(s):\n{}",
                         count,
-                        names.join(", ")
+                        details.join("\n")
                     );
                     let data: Vec<Value> = rows.iter().map(|r| r.to_json()).collect();
                     ToolCallOutput::with_data(summary, json!(data))

@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "realapp1"
+name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
@@ -2256,9 +2256,9 @@ dependencies = [
 
 [[package]]
 name = "rustvani"
-version = "0.2.6"
+version = "0.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a855216d08761a0c25e48f272bbfa24c11ae44ef6bc7a6cf03be3a2b25481a5c"
+checksum = "f3fd1b7ced8b6af1535c2f351249f5adfcbd6a9be44798bf76a60f1df610c0da"
 dependencies = [
  "async-recursion",
  "async-trait",
