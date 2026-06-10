@@ -8,7 +8,7 @@ name = "realapp1"
 path = "src/main.rs"
 
 [dependencies]
-rustvani = "0.2.6"
+rustvani = "0.2.8"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors"] }

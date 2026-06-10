@@ -3,6 +3,8 @@ FROM fedora:40 AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY src/ src/
+COPY .sqlx/ .sqlx/
+ENV SQLX_OFFLINE=true
 RUN dnf install -y gcc gcc-c++ make pkg-config openssl-devel && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
     dnf clean all

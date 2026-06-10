@@ -2,7 +2,7 @@
 # Region: Mumbai (bom) for lowest latency to Indian users
 
 app = "realapp1"
-primary_region = "bom"
+primary_region = "sin"
 
 [build]
   dockerfile = "Dockerfile"

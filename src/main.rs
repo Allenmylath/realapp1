@@ -15,6 +15,7 @@ use rustvani::{
     system_clock, SileroVadNative, VadParams,
     PipelineParams, PipelineTask,
 };
+use rustvani::turn::SmartTurnConfig;
 use rustvani::adapters::schemas::ToolsSchema;
 use rustvani::context::shared_context_with_tools;
 use rustvani::observer::BaseObserver;
@@ -112,6 +113,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
                 vad_analyzer:             Some(vad_analyzer),
                 vad_params:               VadParams { confidence: 0.4, min_volume: 0.1, ..VadParams::default() },
                 audio_out_enabled:        true,
+                turn_config:              Some(SmartTurnConfig { stop_secs: 1.5, ..SmartTurnConfig::default() }),
                 ..TransportParams::default()
             },
         },
