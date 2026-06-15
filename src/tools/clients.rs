@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use rustvani::adapters::schemas::FunctionSchema;
@@ -52,26 +52,77 @@ impl ClientRow {
         })
     }
 
-    /// One-line full detail string for the LLM summary. The LLM only ever
-    /// sees the summary (full_data goes downstream, not into model context),
-    /// so every field the model may be asked about must appear here.
+    /// Detail string for the LLM summary. The LLM only ever sees the summary
+    /// (full_data goes downstream, not into model context), so every field the
+    /// model may be asked about must appear here. Phrased as natural prose
+    /// rather than a pipe-delimited record so that, even though the model is
+    /// told not to recite it, anything that does leak still sounds human. The
+    /// internal id is kept (needed for update_client) but bracketed and flagged
+    /// so the model treats it as reference data, not something to say aloud.
     fn detail_line(&self) -> String {
         let budget = match (self.budget_min, self.budget_max) {
-            (Some(mn), Some(mx)) => format!("₹{} – ₹{}", mn, mx),
-            (Some(mn), None)     => format!("from ₹{}", mn),
-            (None, Some(mx))     => format!("up to ₹{}", mx),
-            (None, None)         => "not specified".to_string(),
+            (Some(mn), Some(mx)) => format!("a budget of ₹{} to ₹{}", mn, mx),
+            (Some(mn), None)     => format!("a budget from ₹{}", mn),
+            (None, Some(mx))     => format!("a budget up to ₹{}", mx),
+            (None, None)         => "no budget on file".to_string(),
         };
+        let areas = match self.preferred_areas.as_deref() {
+            Some(a) => format!("interested in {}", a),
+            None    => "no preferred areas yet".to_string(),
+        };
+        let notes = self.notes.as_deref().unwrap_or("no notes");
         format!(
-            "{} (ID: {}) — Phone: {} | Email: {} | Budget: {} | Areas: {} | Status: {} | Notes: {}",
+            "{} ({}) — phone {}, email {}, {}, {}. Notes: {}. \
+             [internal, do not say aloud: id {}]",
             self.name,
-            self.id,
-            self.phone.as_deref().unwrap_or("not on file"),
+            self.status,
+            self.phone.as_deref().unwrap_or("no phone on file"),
             self.email,
             budget,
-            self.preferred_areas.as_deref().unwrap_or("not specified"),
+            areas,
+            notes,
+            self.id,
+        )
+    }
+
+    /// Briefing string for prep_client — the raw material for a spoken pre-showing
+    /// brief. Ordered the way a realtor wants to hear it: who, how long they've
+    /// been a prospect, what they're after (notes lead), budget, areas, contact.
+    /// The model turns this into a few warm sentences; it must not be recited.
+    fn briefing(&self) -> String {
+        let age = match (Utc::now() - self.created_at).num_days() {
+            d if d <= 0  => "added today".to_string(),
+            1            => "a prospect since yesterday".to_string(),
+            d if d < 14  => format!("a prospect for {} days", d),
+            d if d < 60  => format!("a prospect for about {} weeks", d / 7),
+            d            => format!("a prospect for about {} months", d / 30),
+        };
+        let wants = self.notes.as_deref()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or("no requirements captured yet — worth asking what they're after");
+        let budget = match (self.budget_min, self.budget_max) {
+            (Some(mn), Some(mx)) => format!("budget ₹{} to ₹{}", mn, mx),
+            (Some(mn), None)     => format!("budget from ₹{}", mn),
+            (None, Some(mx))     => format!("budget up to ₹{}", mx),
+            (None, None)         => "no budget on file yet".to_string(),
+        };
+        let areas = match self.preferred_areas.as_deref() {
+            Some(a) => format!("prefers {}", a),
+            None    => "no preferred areas noted".to_string(),
+        };
+        format!(
+            "Prep for {} — {}, currently {}. What they want: {}. {}. {}. \
+             Reach them on {} or {}. \
+             [internal, do not say aloud: id {}]",
+            self.name,
+            age,
             self.status,
-            self.notes.as_deref().unwrap_or("none"),
+            wants,
+            budget,
+            areas,
+            self.phone.as_deref().unwrap_or("no phone on file"),
+            self.email,
+            self.id,
         )
     }
 }
@@ -204,6 +255,69 @@ pub fn client_tool_schemas() -> Vec<FunctionSchema> {
         })),
 
         FunctionSchema::new(
+            "search_clients",
+            "Find a client when you DON'T have their name — search by what they're \
+             looking for, by budget, or by area. Use this for requests like \
+             'who was looking around 80 lakhs?', 'I forgot his name, the guy who needs \
+             a wheelchair-accessible flat', or 'anyone interested in Bandra?'. \
+             All three filters are optional and combine with AND, so you can ask for \
+             'someone under 1 crore wanting a villa in Andheri' in one call. \
+             Provide at least one filter. \
+             Budget mapping: 'up to 1 crore' → budget_max only; 'around 80 lakhs' → \
+             set both budget_min and budget_max to 8000000; 'between 50 lakhs and 1 \
+             crore' → budget_min 5000000 and budget_max 10000000. A client matches a \
+             budget query when their own budget range overlaps the range you give. \
+             Returns up to 10 matching clients with full details. \
+             NOTE: if the realtor gives a NAME, use get_client_by_name instead — this \
+             tool is only for nameless searches.",
+        )
+        .with_parameters(json!({
+            "type": "object",
+            "properties": {
+                "requirements": {
+                    "type": "string",
+                    "description": "What the client wants or a distinguishing characteristic, matched against their notes and preferred areas — e.g. 'wheelchair accessible', 'villa with garden', 'near a good school'. Pass the meaningful words; common filler words are ignored automatically."
+                },
+                "budget_min": {
+                    "type": "integer",
+                    "description": "Lower bound of the budget being searched, in INR. See the budget mapping in the tool description. Omit if no lower bound."
+                },
+                "budget_max": {
+                    "type": "integer",
+                    "description": "Upper bound of the budget being searched, in INR. See the budget mapping in the tool description. Omit if no upper bound."
+                },
+                "area": {
+                    "type": "string",
+                    "description": "Locality or area to match against the client's preferred areas, e.g. 'Bandra'. Omit if not searching by area."
+                }
+            },
+            "required": []
+        })),
+
+        FunctionSchema::new(
+            "prep_client",
+            "Brief the realtor on a client before a showing, call, or meeting. \
+             Use this whenever the realtor wants to be prepped or briefed — e.g. \
+             'prep me for Priya', 'I've got a showing with the Sharmas, catch me up', \
+             'what do I need to know before I call Rahul'. \
+             Looks the client up by name (same fuzzy matching as get_client_by_name) and \
+             returns a briefing: how long they've been a prospect, what they're looking \
+             for, their budget, preferred areas, and contact details. \
+             Deliver it as a short, natural spoken brief — like a colleague catching the \
+             realtor up before they walk in — not as a list of fields.",
+        )
+        .with_parameters(json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name or partial name of the client to be briefed on. Phonetically similar or misspelled names are also found."
+                }
+            },
+            "required": ["name"]
+        })),
+
+        FunctionSchema::new(
             "update_client",
             "Update an existing client's details in the CRM. \
              First locate the client with get_client_by_name to obtain their ID, \
@@ -280,10 +394,12 @@ pub fn client_tool_schemas() -> Vec<FunctionSchema> {
 pub fn register_client_tools(registry: &mut FunctionRegistry, pool: Arc<PgPool>) {
     register_add_client(registry, pool.clone());
     register_get_client_by_name(registry, pool.clone());
+    register_search_clients(registry, pool.clone());
+    register_prep_client(registry, pool.clone());
     register_update_client(registry, pool.clone());
     register_list_clients(registry, pool.clone());
     log::info!(
-        "ClientTools: registered add_client, get_client_by_name, update_client, list_clients"
+        "ClientTools: registered add_client, get_client_by_name, search_clients, prep_client, update_client, list_clients"
     );
 }
 
@@ -346,19 +462,20 @@ fn register_add_client(registry: &mut FunctionRegistry, pool: Arc<PgPool>) {
             match result {
                 Ok(row) => {
                     let budget_str = match (budget_min, budget_max) {
-                        (Some(mn), Some(mx)) => format!(" | Budget: ₹{} – ₹{}", mn, mx),
-                        (Some(mn), None)     => format!(" | Budget from: ₹{}", mn),
-                        (None, Some(mx))     => format!(" | Budget up to: ₹{}", mx),
+                        (Some(mn), Some(mx)) => format!(", budget ₹{} to ₹{}", mn, mx),
+                        (Some(mn), None)     => format!(", budget from ₹{}", mn),
+                        (None, Some(mx))     => format!(", budget up to ₹{}", mx),
                         (None, None)         => String::new(),
                     };
                     let areas_str = preferred_areas
                         .as_deref()
-                        .map(|a| format!(" | Areas: {}", a))
+                        .map(|a| format!(", interested in {}", a))
                         .unwrap_or_default();
 
                     let summary = format!(
-                        "Client '{}' added (ID: {}). Phone: {} | Email: {}{}{}. Notes: {}",
-                        name, row.id, phone, email, budget_str, areas_str, notes
+                        "Saved {} — phone {}, email {}{}{}. Notes: {}. \
+                         [internal, do not say aloud: id {}]",
+                        name, phone, email, budget_str, areas_str, notes, row.id
                     );
                     let data = json!({
                         "id":              row.id,
@@ -416,7 +533,8 @@ fn register_get_client_by_name(registry: &mut FunctionRegistry, pool: Arc<PgPool
             let count = rows.len();
             let details: Vec<String> = rows.iter().map(|r| r.detail_line()).collect();
             let summary = format!(
-                "Found {} client(s) for '{}' via {}:\n{}",
+                "Found {} client(s) matching '{}'. \
+                 [internal, do not say aloud: matched via {}]\n{}",
                 count,
                 raw_name,
                 method,
@@ -433,6 +551,210 @@ fn register_get_client_by_name(registry: &mut FunctionRegistry, pool: Arc<PgPool
                 .collect();
 
             ToolCallOutput::with_data(summary, json!(data))
+        }
+    });
+}
+
+// ── search_clients ─────────────────────────────────────────────────────────
+
+/// Builds the dynamic search query from whichever filters were supplied.
+/// `use_fulltext` controls how `requirements` is matched: full-text
+/// (websearch_to_tsquery, the primary path) or a plain ILIKE substring fallback.
+fn build_search_query<'a>(
+    requirements: Option<&'a str>,
+    budget_min: Option<i64>,
+    budget_max: Option<i64>,
+    area: Option<&'a str>,
+    use_fulltext: bool,
+) -> QueryBuilder<'a, Postgres> {
+    let mut qb = QueryBuilder::new(
+        "SELECT id, name, email, phone, budget_min, budget_max, \
+         preferred_areas, status, notes, created_at FROM clients WHERE 1=1",
+    );
+
+    if let Some(req) = requirements {
+        if use_fulltext {
+            // websearch_to_tsquery drops stopwords and stems, so a phrase like
+            // "guy on a wheelchair" reduces to `wheelchair` and matches notes
+            // containing "wheelchair accessible". No extension required.
+            qb.push(
+                " AND to_tsvector('english', coalesce(notes,'') || ' ' || \
+                 coalesce(preferred_areas,'')) @@ websearch_to_tsquery('english', ",
+            );
+            qb.push_bind(req);
+            qb.push(")");
+        } else {
+            qb.push(" AND notes ILIKE ");
+            qb.push_bind(format!("%{}%", req));
+        }
+    }
+
+    if budget_min.is_some() || budget_max.is_some() {
+        // A client matches when their own budget range overlaps the queried
+        // range; NULL bounds on the client are treated as open-ended.
+        let qmin = budget_min.unwrap_or(0);
+        let qmax = budget_max.unwrap_or(i64::MAX);
+        qb.push(" AND (budget_max IS NULL OR budget_max >= ");
+        qb.push_bind(qmin);
+        qb.push(") AND (budget_min IS NULL OR budget_min <= ");
+        qb.push_bind(qmax);
+        qb.push(")");
+    }
+
+    if let Some(a) = area {
+        qb.push(" AND preferred_areas ILIKE ");
+        qb.push_bind(format!("%{}%", a));
+    }
+
+    qb.push(" ORDER BY created_at DESC LIMIT 10");
+    qb
+}
+
+fn register_search_clients(registry: &mut FunctionRegistry, pool: Arc<PgPool>) {
+    registry.register_data("search_clients", move |args: String| {
+        let pool = pool.clone();
+        async move {
+            let v: Value = match serde_json::from_str(&args) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ToolCallOutput::summary_only(format!(
+                        "Failed to parse arguments: {}",
+                        e
+                    ));
+                }
+            };
+
+            let requirements = v["requirements"].as_str()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            let budget_min = v["budget_min"].as_i64();
+            let budget_max = v["budget_max"].as_i64();
+            let area = v["area"].as_str()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+
+            if requirements.is_none() && budget_min.is_none()
+                && budget_max.is_none() && area.is_none()
+            {
+                return ToolCallOutput::summary_only(
+                    "No search filters given. Ask the realtor what to go on — what the \
+                     client's after, roughly what budget, or which area.",
+                );
+            }
+
+            // Plain-language description of the search, for the no-match message.
+            let mut criteria: Vec<String> = Vec::new();
+            if let Some(req) = requirements {
+                criteria.push(format!("looking for '{}'", req));
+            }
+            match (budget_min, budget_max) {
+                (Some(mn), Some(mx)) if mn == mx => criteria.push(format!("budget around ₹{}", mn)),
+                (Some(mn), Some(mx)) => criteria.push(format!("budget between ₹{} and ₹{}", mn, mx)),
+                (Some(mn), None)     => criteria.push(format!("budget from ₹{}", mn)),
+                (None, Some(mx))     => criteria.push(format!("budget up to ₹{}", mx)),
+                (None, None)         => {}
+            }
+            if let Some(a) = area {
+                criteria.push(format!("area '{}'", a));
+            }
+            let criteria_str = criteria.join(", ");
+
+            // Primary: full-text on requirements. If nothing matches and the
+            // ONLY filter was requirements, retry once with an ILIKE fallback
+            // for short or oddly-phrased terms full-text might miss.
+            let mut qb = build_search_query(requirements, budget_min, budget_max, area, true);
+            let mut rows = match qb.build_query_as::<ClientRow>().fetch_all(pool.as_ref()).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    log::error!("search_clients DB error: {}", e);
+                    return ToolCallOutput::summary_only(format!("Database error: {}", e));
+                }
+            };
+
+            let requirements_only =
+                requirements.is_some() && budget_min.is_none()
+                && budget_max.is_none() && area.is_none();
+            if rows.is_empty() && requirements_only {
+                let mut qb = build_search_query(requirements, budget_min, budget_max, area, false);
+                match qb.build_query_as::<ClientRow>().fetch_all(pool.as_ref()).await {
+                    Ok(r) => rows = r,
+                    Err(e) => log::warn!("search_clients ILIKE fallback failed: {}", e),
+                }
+            }
+
+            if rows.is_empty() {
+                return ToolCallOutput::summary_only(format!(
+                    "No clients found matching {}.",
+                    criteria_str
+                ));
+            }
+
+            let count = rows.len();
+            let details: Vec<String> = rows.iter().map(|r| r.detail_line()).collect();
+            let summary = format!(
+                "Found {} client(s) matching {}.\n{}",
+                count,
+                criteria_str,
+                details.join("\n")
+            );
+            let data: Vec<Value> = rows.iter().map(|r| r.to_json()).collect();
+            ToolCallOutput::with_data(summary, json!(data))
+        }
+    });
+}
+
+// ── prep_client ──────────────────────────────────────────────────────────────
+
+fn register_prep_client(registry: &mut FunctionRegistry, pool: Arc<PgPool>) {
+    registry.register_data("prep_client", move |args: String| {
+        let pool = pool.clone();
+        async move {
+            let v: Value = match serde_json::from_str(&args) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ToolCallOutput::summary_only(format!(
+                        "Failed to parse arguments: {}",
+                        e
+                    ));
+                }
+            };
+
+            let raw_name = match v["name"].as_str() {
+                Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+                _ => return ToolCallOutput::summary_only("Missing required field: name"),
+            };
+
+            let (rows, _method) = do_search(pool.as_ref(), &raw_name).await;
+
+            match rows.len() {
+                0 => ToolCallOutput::summary_only(format!(
+                    "No client found matching '{}', so there's nothing to brief on. \
+                     Ask the realtor to confirm the name.",
+                    raw_name
+                )),
+                // Several people match — don't risk briefing the wrong one. Hand
+                // back a short disambiguation list so the model can ask which.
+                1 => {
+                    let row = &rows[0];
+                    ToolCallOutput::with_data(row.briefing(), row.to_json())
+                }
+                _ => {
+                    let options: Vec<String> = rows
+                        .iter()
+                        .map(|r| {
+                            let area = r.preferred_areas.as_deref().unwrap_or("no area on file");
+                            format!("{} ({})", r.name, area)
+                        })
+                        .collect();
+                    let summary = format!(
+                        "Several clients match '{}' — ask the realtor which one before briefing: {}.",
+                        raw_name,
+                        options.join("; ")
+                    );
+                    let data: Vec<Value> = rows.iter().map(|r| r.to_json()).collect();
+                    ToolCallOutput::with_data(summary, json!(data))
+                }
+            }
         }
     });
 }
