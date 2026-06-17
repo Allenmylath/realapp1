@@ -15,6 +15,8 @@ use rustvani::{
     system_clock, SileroVadNative, VadParams,
     PipelineParams, PipelineTask,
 };
+use rustvani::billing::{BillingStorage, PostgresBillingStorage, SessionBilling};
+use uuid::Uuid;
 use rustvani::turn::SmartTurnConfig;
 use rustvani::adapters::schemas::ToolsSchema;
 use rustvani::context::shared_context_with_tools;
@@ -120,6 +122,8 @@ struct AppState {
     deepgram_api_key: String,
     /// Shared DB pool — cloned (Arc) into each connection's tool closures.
     db_pool:          Arc<sqlx::PgPool>,
+    /// Shared billing storage — created once, cloned (Arc) into each connection.
+    billing_storage:  Arc<dyn BillingStorage>,
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +164,15 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
         },
     );
 
+    // --- Billing session (one per connection) ---
+    let session_id = Uuid::new_v4();
+    let (billing, billing_handle) =
+        SessionBilling::new(session_id, app_state.billing_storage.clone(), 256);
+
+    // Shared turn-id cells link transcript turns to the conversation.
+    let active_user_turn_id = Arc::new(std::sync::Mutex::new(None));
+    let active_bot_turn_id  = Arc::new(std::sync::Mutex::new(None));
+
     // --- Build registry and register client tools ---
     let mut registry = FunctionRegistry::new();
     register_client_tools(&mut registry, app_state.db_pool.clone());
@@ -187,6 +200,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
         mode:     Some("transcribe".to_string()),
         ..SarvamSttConfig::default()
     })
+    .with_billing(billing.clone())
     .into_processor();
 
     // --- LLM with registry ---
@@ -198,6 +212,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
         },
         registry,
     )
+    .with_billing(billing.clone())
     .into_processor();
 
     // --- TTS ---
@@ -205,13 +220,17 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
         api_key: app_state.deepgram_api_key.clone(),
         ..DeepgramTtsConfig::default()
     }) {
-        Ok(t)  => t.into_processor(),
+        Ok(t)  => t.with_billing(billing.clone()).into_processor(),
         Err(e) => { log::error!("[conn={}] TTS init failed: {}", conn_id, e); return; }
     };
 
-    // --- Aggregators ---
-    let user_agg      = LLMUserAggregator::new(context.clone());
-    let assistant_agg = LLMAssistantAggregator::new(context.clone());
+    // --- Aggregators (these emit transcript turns) ---
+    let user_agg = LLMUserAggregator::with_billing(
+        context.clone(), billing.clone(), active_user_turn_id.clone(),
+    );
+    let assistant_agg = LLMAssistantAggregator::with_billing(
+        context.clone(), billing.clone(), active_bot_turn_id.clone(),
+    );
 
     // --- Pipeline ---
     let task = PipelineTask::new(
@@ -225,7 +244,12 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
             tts,
             transport.output(),
         ],
-        PipelineParams { allow_interruptions: true, ..PipelineParams::default() },
+        PipelineParams {
+            allow_interruptions:  true,
+            enable_usage_metrics: true,
+            billing_collector:    Some(billing.clone()),
+            ..PipelineParams::default()
+        },
     );
 
     let push_tx = task.push_sender();
@@ -234,6 +258,13 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
         async { task.run(system_clock(), Some(ravi_observer)).await.ok(); },
         transport.run_socket(socket, push_tx),
     );
+
+    // Drop the collector so the drain task can flush the final checkpoint +
+    // finalize_session, then wait (bounded) for it to land before returning.
+    drop(billing);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10), billing_handle,
+    ).await;
 
     log::info!("[conn={}] disconnected", conn_id);
 }
@@ -268,11 +299,30 @@ async fn main() {
     let db_pool = Arc::new(db_pool);
     log::info!("Database pool initialised");
 
+    // --- Billing storage (tokio_postgres, separate from the sqlx pool above) ---
+    let connector = native_tls::TlsConnector::builder().build().unwrap();
+    let tls = postgres_native_tls::MakeTlsConnector::new(connector);
+    let (pg_client, pg_conn) = tokio_postgres::connect(&database_url, tls)
+        .await
+        .expect("billing DB connect failed");
+    tokio::spawn(async move {
+        if let Err(e) = pg_conn.await {
+            log::error!("billing DB connection dropped: {e}");
+        }
+    });
+    PostgresBillingStorage::run_migrations(&pg_client)
+        .await
+        .expect("billing migrations failed");
+    let billing_storage: Arc<dyn BillingStorage> =
+        Arc::new(PostgresBillingStorage::new(pg_client));
+    log::info!("Billing storage initialised (billing_sessions + billing_events)");
+
     let app_state = AppState {
         sarvam_api_key:   std::env::var("SARVAM_API_KEY").expect("SARVAM_API_KEY not set"),
         openai_api_key:   std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set"),
         deepgram_api_key: std::env::var("DEEPGRAM_API_KEY").expect("DEEPGRAM_API_KEY not set"),
         db_pool,
+        billing_storage,
     };
 
     let app = Router::new()

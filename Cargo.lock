@@ -2000,10 +2000,13 @@ dependencies = [
  "chrono",
  "env_logger",
  "log",
+ "native-tls",
+ "postgres-native-tls",
  "rustvani",
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-postgres",
  "tower-http 0.5.2",
  "uuid",
 ]
@@ -2265,9 +2268,9 @@ dependencies = [
 
 [[package]]
 name = "rustvani"
-version = "0.4.0-dev.0"
+version = "0.4.0-dev.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdf8846cc8ebb9e68a141cd0c586e9c89dc2c6305629054634c2573349fb550f"
+checksum = "24876bddacf38242d298a73cb6fb2da81e49a41a3dcac63802860d4d271c3502"
 dependencies = [
  "arc-swap",
  "async-recursion",
