@@ -32,6 +32,9 @@ primary_region = "sin"
   protocol = "http"
   timeout = "5s"
 
+# Media flows P2P over WebRTC (relayed via TURN), not through the Fly proxy, so
+# no UDP service is declared here. Only the signaling WebSocket uses http_service.
+
 [[vm]]
   size = "shared-cpu-1x"
   memory = "512mb"

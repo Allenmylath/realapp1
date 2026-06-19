@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>rustvani WebRTC test client</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.25rem; }
+    button { font-size: 1rem; padding: 0.6rem 1.1rem; margin-right: 0.5rem; border-radius: 8px; cursor: pointer; }
+    #status { font-weight: 600; }
+    .dot { display: inline-block; width: 0.6rem; height: 0.6rem; border-radius: 50%; margin-right: 0.4rem; background: #999; }
+    .dot.on { background: #1faa59; }
+    .dot.err { background: #d33; }
+    #log { margin-top: 1rem; font-family: ui-monospace, monospace; font-size: 0.8rem; white-space: pre-wrap;
+           background: rgba(127,127,127,0.12); padding: 0.75rem; border-radius: 8px; height: 16rem; overflow-y: auto; }
+    .row { margin: 1rem 0; }
+  </style>
+</head>
+<body>
+  <h1>rustvani WebRTC test client</h1>
+
+  <div class="row">
+    <span id="dot" class="dot"></span>
+    <span id="status">idle</span>
+  </div>
+
+  <div class="row">
+    <button id="connect">Connect &amp; talk</button>
+    <button id="interrupt" disabled>Interrupt</button>
+    <button id="hangup" disabled>Hang up</button>
+  </div>
+
+  <audio id="bot-audio" autoplay></audio>
+  <div id="log"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+    function log(...args) {
+      const line = args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
+      logEl.textContent += line + "\n";
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(...args);
+    }
+    function setStatus(text, state) {
+      $("status").textContent = text;
+      const dot = $("dot");
+      dot.className = "dot" + (state === "on" ? " on" : state === "err" ? " err" : "");
+    }
+
+    // Signaling endpoint: same host, /ws, ws:// or wss:// matching the page scheme.
+    const SIGNALING_URL =
+      (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+
+    // ICE servers (STUN + short-lived Cloudflare TURN creds) are fetched at
+    // connect time from the server's /ice endpoint, so nothing is hardcoded.
+    async function getIceServers() {
+      const r = await fetch("/ice");
+      if (!r.ok) throw new Error("/ice returned " + r.status);
+      const data = await r.json();
+      return data.iceServers; // RTCConfiguration-ready array
+    }
+
+    let pc = null, ws = null, micStream = null, control = null;
+
+    async function connect() {
+      $("connect").disabled = true;
+      setStatus("connecting…", null);
+      log("signaling:", SIGNALING_URL);
+
+      // relay-only: media must go via TURN (server is IPv6-only, browser IPv4 —
+      // a TURN relay is the only same-family bridge between them).
+      let iceServers;
+      try {
+        iceServers = await getIceServers();
+      } catch (e) {
+        setStatus("ICE fetch failed", "err");
+        log("getIceServers failed:", e.message);
+        cleanup();
+        return;
+      }
+      // relay-only: media must go via TURN (server is IPv6-only, browser IPv4 —
+      // a TURN relay is the only same-family bridge between them).
+      pc = new RTCPeerConnection({ iceServers, iceTransportPolicy: "relay" });
+      ws = new WebSocket(SIGNALING_URL);
+
+      // ---- Mic -> bot ----
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, autoGainControl: true },
+        });
+      } catch (e) {
+        setStatus("mic denied", "err");
+        log("getUserMedia failed:", e.message);
+        cleanup();
+        return;
+      }
+      micStream.getTracks().forEach((t) => pc.addTrack(t, micStream));
+
+      // ---- Bot -> speaker ----
+      pc.ontrack = (e) => {
+        log("ontrack:", e.track.kind);
+        $("bot-audio").srcObject = e.streams[0];
+      };
+
+      // ---- Control data channel (CLIENT must create it) ----
+      control = pc.createDataChannel("control");
+      control.onopen = () => { log("data channel open"); $("interrupt").disabled = false; };
+      control.onclose = () => log("data channel closed");
+      control.onmessage = (e) => {
+        let msg;
+        try { msg = JSON.parse(e.data); } catch { log("dc (non-JSON):", e.data); return; }
+        log("server msg:", msg);
+        if (msg.type === "interruption") flushPlayback();
+      };
+
+      // ---- Trickle local ICE -> server ----
+      pc.onicecandidate = (e) => {
+        if (e.candidate) {
+          send({
+            type: "ice",
+            candidate: e.candidate.candidate,
+            sdpMid: e.candidate.sdpMid,
+            sdpMLineIndex: e.candidate.sdpMLineIndex,
+          });
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        log("pc state:", pc.connectionState);
+        if (pc.connectionState === "connected") setStatus("connected — talk!", "on");
+        if (["failed", "disconnected", "closed"].includes(pc.connectionState))
+          setStatus(pc.connectionState, "err");
+      };
+
+      // ---- Signaling from server ----
+      ws.onmessage = async (e) => {
+        let msg;
+        try { msg = JSON.parse(e.data); } catch { return; }
+        if (msg.type === "answer") {
+          log("<- answer");
+          await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+        } else if (msg.type === "ice") {
+          await pc.addIceCandidate({
+            candidate: msg.candidate,
+            sdpMid: msg.sdpMid ?? null,
+            sdpMLineIndex: msg.sdpMLineIndex ?? null,
+          }).catch((err) => log("addIceCandidate err:", err.message));
+        } else if (msg.type === "bye") {
+          log("<- bye");
+          cleanup();
+        }
+      };
+
+      ws.onerror = () => { setStatus("signaling error", "err"); log("ws error"); };
+      ws.onclose = () => log("ws closed");
+
+      // ---- Once WS is open, send the offer (client is the offerer) ----
+      ws.onopen = async () => {
+        log("ws open");
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        send({ type: "offer", sdp: offer.sdp });
+        log("-> offer");
+        $("hangup").disabled = false;
+      };
+    }
+
+    function send(obj) {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+    }
+
+    function flushPlayback() {
+      // Bot was interrupted: stop stale audio from playing out.
+      const el = $("bot-audio");
+      const s = el.srcObject;
+      el.srcObject = null;
+      el.srcObject = s;
+      el.play().catch(() => {});
+      log("flushed playback (interruption)");
+    }
+
+    function interrupt() {
+      if (control && control.readyState === "open") {
+        control.send(JSON.stringify({ type: "client_interruption" }));
+        log("-> client_interruption");
+      }
+    }
+
+    function hangup() {
+      send({ type: "bye" });
+      cleanup();
+    }
+
+    function cleanup() {
+      try { micStream && micStream.getTracks().forEach((t) => t.stop()); } catch {}
+      try { control && control.close(); } catch {}
+      try { pc && pc.close(); } catch {}
+      try { ws && ws.close(); } catch {}
+      pc = ws = micStream = control = null;
+      $("connect").disabled = false;
+      $("interrupt").disabled = true;
+      $("hangup").disabled = true;
+      setStatus("idle", null);
+    }
+
+    $("connect").onclick = connect;
+    $("interrupt").onclick = interrupt;
+    $("hangup").onclick = hangup;
+  </script>
+</body>
+</html>

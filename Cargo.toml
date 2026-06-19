@@ -8,7 +8,8 @@ name = "realapp1"
 path = "src/main.rs"
 
 [dependencies]
-rustvani = "0.4.0-dev.2"
+rustvani = { version = "0.4.0-dev.5", features = ["vaniwebrtc"] }
+reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors"] }

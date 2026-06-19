@@ -4,8 +4,10 @@ use std::sync::Arc;
 
 use axum::{
     Router,
+    Json,
     extract::{State, WebSocketUpgrade, ws::WebSocket},
-    response::IntoResponse,
+    http::StatusCode,
+    response::{Html, IntoResponse},
     routing::get,
 };
 use sqlx::postgres::PgPoolOptions;
@@ -35,7 +37,7 @@ use rustvani::services::{
     DeepgramTtsConfig, DeepgramTtsHandler,
 };
 use rustvani::services::llm::FunctionRegistry;
-use rustvani::transport::websocket::{WebSocketParams, WebSocketTransport};
+use rustvani::transport::vaniwebrtc::{TurnServer, VaniWebRTCParams, VaniWebRTCTransport};
 use rustvani::transport::TransportParams;
 
 use tools::{client_tool_schemas, register_client_tools};
@@ -124,6 +126,63 @@ struct AppState {
     db_pool:          Arc<sqlx::PgPool>,
     /// Shared billing storage — created once, cloned (Arc) into each connection.
     billing_storage:  Arc<dyn BillingStorage>,
+    /// STUN server URLs for the WebRTC transport; cloned per conn.
+    ice_servers:      Vec<String>,
+    /// Shared HTTP client for minting Cloudflare TURN credentials.
+    http:             reqwest::Client,
+    /// Cloudflare Realtime TURN key id + API token (from secrets). Used to mint
+    /// short-lived TURN creds for both the server's peer connection and the
+    /// browser (via `GET /ice`). TURN gives the server an IPv4 relay candidate
+    /// an IPv4 browser can pair with — the bridge across Fly's IPv6-only NIC.
+    turn_key_id:      String,
+    turn_api_token:   String,
+}
+
+/// Mint short-lived ICE servers from Cloudflare. Returns the raw
+/// `{ "iceServers": [...] }` body (STUN entry + a TURN entry with creds).
+async fn mint_cloudflare_ice(state: &AppState) -> Result<serde_json::Value, String> {
+    let url = format!(
+        "https://rtc.live.cloudflare.com/v1/turn/keys/{}/credentials/generate-ice-servers",
+        state.turn_key_id,
+    );
+    let resp = state
+        .http
+        .post(&url)
+        .bearer_auth(&state.turn_api_token)
+        .json(&serde_json::json!({ "ttl": 86_400 }))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Cloudflare TURN API returned {}", resp.status()));
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("bad JSON: {e}"))
+}
+
+/// Pull the TURN entries (those carrying username/credential) out of a minted
+/// Cloudflare ICE response into `rustvani` `TurnServer`s. The STUN-only entry,
+/// which has no credentials, is naturally skipped.
+fn turn_servers_from_ice(ice: &serde_json::Value) -> Vec<TurnServer> {
+    ice.get("iceServers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let username = e.get("username")?.as_str()?.to_string();
+                    let credential = e.get("credential")?.as_str()?.to_string();
+                    let urls = e
+                        .get("urls")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|u| u.as_str().map(String::from))
+                        .collect();
+                    Some(TurnServer { urls, username, credential })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -141,14 +200,23 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
     let conn_id = next_conn_id();
     log::info!("[conn={}] connected", conn_id);
 
+    // Mint fresh TURN creds for this connection's peer connection.
+    let turn_servers = match mint_cloudflare_ice(&app_state).await {
+        Ok(ice) => turn_servers_from_ice(&ice),
+        Err(e) => {
+            log::error!("[conn={}] TURN mint failed: {} — media may not connect", conn_id, e);
+            vec![]
+        }
+    };
+
     let vad_analyzer = match SileroVadNative::new(16_000) {
         Ok(v)  => Arc::new(v),
         Err(e) => { log::error!("[conn={}] VAD init failed: {}", conn_id, e); return; }
     };
 
-    let transport = WebSocketTransport::new(
-        &format!("WsTransport-{}", conn_id),
-        WebSocketParams {
+    let transport = VaniWebRTCTransport::new(
+        &format!("VaniWebRTCTransport-{}", conn_id),
+        VaniWebRTCParams {
             transport: TransportParams {
                 audio_in_enabled:         true,
                 audio_in_sample_rate:     Some(16_000),
@@ -158,9 +226,19 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
                 vad_analyzer:             Some(vad_analyzer),
                 vad_params:               VadParams { confidence: 0.4, min_volume: 0.1, ..VadParams::default() },
                 audio_out_enabled:        true,
+                // Deepgram TTS emits 24 kHz PCM; the transport defaults to 16 kHz
+                // when unset, which would play the voice ~1.5× slow (stretched/
+                // pitched down). Match the TTS rate so Opus resamples correctly.
+                audio_out_sample_rate:    Some(24_000),
                 turn_config:              Some(SmartTurnConfig { stop_secs: 1.5, ..SmartTurnConfig::default() }),
                 ..TransportParams::default()
             },
+            // STUN + TURN. TURN gives the server an IPv4 relay candidate so an
+            // IPv4 browser can pair with the IPv6-only Fly host. Opus tuning and
+            // the optional 48 kHz denoiser hook keep their defaults.
+            ice_servers:  app_state.ice_servers.clone(),
+            turn_servers: turn_servers.clone(),
+            ..VaniWebRTCParams::default()
         },
     );
 
@@ -256,7 +334,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
 
     tokio::join!(
         async { task.run(system_clock(), Some(ravi_observer)).await.ok(); },
-        transport.run_socket(socket, push_tx),
+        transport.run(socket, push_tx),
     );
 
     // Drop the collector so the drain task can flush the final checkpoint +
@@ -274,6 +352,28 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
 // ---------------------------------------------------------------------------
 
 async fn health() -> &'static str { "ok" }
+
+// ---------------------------------------------------------------------------
+// Static test client
+// ---------------------------------------------------------------------------
+
+/// Minimal browser WebRTC client for exercising the agent end-to-end.
+/// Embedded at compile time so it ships inside the binary / Docker image.
+async fn client() -> impl IntoResponse {
+    Html(include_str!("../static/client.html"))
+}
+
+/// Mint short-lived ICE servers for the browser. The client fetches this before
+/// creating its RTCPeerConnection so it has working (ephemeral) TURN creds.
+async fn ice(State(state): State<AppState>) -> impl IntoResponse {
+    match mint_cloudflare_ice(&state).await {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => {
+            log::error!("/ice mint failed: {}", e);
+            (StatusCode::BAD_GATEWAY, "failed to mint ICE servers").into_response()
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Main
@@ -317,15 +417,29 @@ async fn main() {
         Arc::new(PostgresBillingStorage::new(pg_client));
     log::info!("Billing storage initialised (billing_sessions + billing_events)");
 
+    let ice_servers: Vec<String> = vec!["stun:stun.l.google.com:19302".to_string()];
+
+    // Cloudflare Realtime TURN keys (set as Fly secrets). TURN creds are minted
+    // per use; without these, media will NOT connect from Fly's IPv6-only host.
+    let turn_key_id    = std::env::var("TURN_TOKEN_ID").expect("TURN_TOKEN_ID not set");
+    let turn_api_token = std::env::var("TURN_API_TOKEN").expect("TURN_API_TOKEN not set");
+    log::info!("ICE: stun={:?}, Cloudflare TURN key {}", ice_servers, turn_key_id);
+
     let app_state = AppState {
         sarvam_api_key:   std::env::var("SARVAM_API_KEY").expect("SARVAM_API_KEY not set"),
         openai_api_key:   std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set"),
         deepgram_api_key: std::env::var("DEEPGRAM_API_KEY").expect("DEEPGRAM_API_KEY not set"),
         db_pool,
         billing_storage,
+        ice_servers,
+        http: reqwest::Client::new(),
+        turn_key_id,
+        turn_api_token,
     };
 
     let app = Router::new()
+        .route("/", get(client))
+        .route("/ice", get(ice))
         .route("/ws", get(ws_handler))
         .route("/health", get(health))
         .layer(CorsLayer::permissive())
